@@ -1,0 +1,7 @@
+<configuration>
+    <input>
+        <net-file value="../sumo_scenarios/grid.net.xml"/>
+        <route-files value="turn_40_routes.xml"/>
+    </input>
+    <time><begin value="0"/><end value="3600"/></time>
+</configuration>

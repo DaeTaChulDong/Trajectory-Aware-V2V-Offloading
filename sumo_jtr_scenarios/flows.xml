@@ -1,0 +1,14 @@
+<routes>
+  <flow id="f0" begin="0" end="3600" number="83" from="A1B1" departSpeed="max" departLane="best"/>
+  <flow id="f1" begin="0" end="3600" number="83" from="A2B2" departSpeed="max" departLane="best"/>
+  <flow id="f2" begin="0" end="3600" number="83" from="A3B3" departSpeed="max" departLane="best"/>
+  <flow id="f3" begin="0" end="3600" number="83" from="B0B1" departSpeed="max" departLane="best"/>
+  <flow id="f4" begin="0" end="3600" number="83" from="B4B3" departSpeed="max" departLane="best"/>
+  <flow id="f5" begin="0" end="3600" number="83" from="C0C1" departSpeed="max" departLane="best"/>
+  <flow id="f6" begin="0" end="3600" number="83" from="C4C3" departSpeed="max" departLane="best"/>
+  <flow id="f7" begin="0" end="3600" number="83" from="D0D1" departSpeed="max" departLane="best"/>
+  <flow id="f8" begin="0" end="3600" number="83" from="D4D3" departSpeed="max" departLane="best"/>
+  <flow id="f9" begin="0" end="3600" number="83" from="E1D1" departSpeed="max" departLane="best"/>
+  <flow id="f10" begin="0" end="3600" number="83" from="E2D2" departSpeed="max" departLane="best"/>
+  <flow id="f11" begin="0" end="3600" number="83" from="E3D3" departSpeed="max" departLane="best"/>
+</routes>
