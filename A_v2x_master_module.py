@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 import xml.etree.ElementTree as ET
+import matplotlib.pyplot as plt # 🌟 산점도 시각화를 위해 추가
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -30,8 +31,8 @@ class V2XConfig:
         self.use_embedding = True  
         self.task_scale = 1.0
         self.max_svs = 10
-        self.alpha = 0.4  
-        self.beta = 0.6   
+        self.alpha = 0.6  
+        self.beta = 0.4   
         self.f_tv = 2.5
         self.f_sv_min, self.f_sv_max = 10.0, 50.0
         self.comm_range = 100.0  
@@ -79,6 +80,21 @@ class IntentionEncoder(nn.Module):
         latent = self.encoder(raw_data)
         return F.normalize(latent, p=2, dim=1)
 
+class ConnectionPredictor(nn.Module):
+    def __init__(self):
+        super(ConnectionPredictor, self).__init__()
+        # 입력 차원 4: [cosine_similarity, dist_norm, rel_speed_norm, heading_diff_norm]
+        self.net = nn.Sequential(
+            nn.Linear(4, 32), nn.ReLU(),
+            nn.Linear(32, 16), nn.ReLU(),
+            nn.Linear(16, 1), nn.Sigmoid()
+        )
+    
+    def forward(self, similarity, phys_info):
+        # similarity는 1D 텐서이므로 차원을 늘려 결합
+        x = torch.cat([similarity.unsqueeze(-1), phys_info], dim=-1)
+        return self.net(x)
+
 def _get_raw_features(vid, net):
     pos = traci.vehicle.getPosition(vid)
     speed = traci.vehicle.getSpeed(vid)
@@ -117,7 +133,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             pos_dict = {vid: traci.vehicle.getPosition(vid) for vid in veh_ids}
             
             ended_pairs = []
-            for (v1, v2), (start_t, r1, r2) in active_pairs.items():
+            for (v1, v2), (start_t, r1, r2, phys_info) in active_pairs.items():
                 both_alive = (v1 in pos_dict and v2 in pos_dict)
                 if not both_alive:
                     ended_pairs.append(((v1, v2), False)) 
@@ -127,12 +143,12 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
                         ended_pairs.append(((v1, v2), True)) 
             
             for pair, is_valid in ended_pairs:
-                start_t, r1, r2 = active_pairs.pop(pair)
+                start_t, r1, r2, phys_info = active_pairs.pop(pair)
                 if is_valid:
                     actual_conn_time = current_time - start_t
                     if actual_conn_time > 1.0: 
                         target_t_norm = min(actual_conn_time, 30.0) / 30.0
-                        dataset.append((r1, r2, target_t_norm))
+                        dataset.append((r1, r2, phys_info, target_t_norm))
             
             if len(veh_ids) >= 2:
                 sample_size = min(len(veh_ids), 20)
@@ -145,23 +161,24 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
                             if dist <= 100.0:
                                 r1 = _get_raw_features(v1, net)
                                 r2 = _get_raw_features(v2, net)
-                                active_pairs[(v1, v2)] = (current_time, r1, r2)
+                                
+                                spd1, spd2 = traci.vehicle.getSpeed(v1), traci.vehicle.getSpeed(v2)
+                                rel_speed = abs(spd1 - spd2) / 30.0
+                                dist_norm = dist / 100.0
+                                h1, h2 = traci.vehicle.getAngle(v1) / 360.0, traci.vehicle.getAngle(v2) / 360.0
+                                heading_diff = abs(h1 - h2)
+                                if heading_diff > 0.5: heading_diff = 1.0 - heading_diff
+                                
+                                phys_info = torch.FloatTensor([[dist_norm, rel_speed, heading_diff]])
+                                active_pairs[(v1, v2)] = (current_time, r1, r2, phys_info)
     finally:
         traci.close()
         
     print(f"[Phase 1-A] 완료. 총 {len(dataset)} 쌍의 실제 궤적 데이터 수집됨.")
     
-    confs = [d[2] for d in dataset]
-    if len(confs) > 0:
-        print(f"  [데이터 분포 진단] Normalized Target Time (0~1):")
-        print(f"     - Mean: {np.mean(confs):.3f}")
-        print(f"     - Median: {np.median(confs):.3f}")
-        print(f"     - < 0.5 비율 (<15초 단절): {np.mean(np.array(confs) < 0.5) * 100:.1f}%")
-        print(f"     - == 1.0 비율 (30초 이상 생존): {np.mean(np.array(confs) >= 0.99) * 100:.1f}%")
-    
     print("\n[Phase 1-B] 수집된 데이터로 인코더 및 Predictor 훈련 시작...")
     encoder = IntentionEncoder()
-    predictor = nn.Sequential(nn.Linear(1, 1), nn.Sigmoid()) 
+    predictor = ConnectionPredictor()
     optimizer = optim.Adam(list(encoder.parameters()) + list(predictor.parameters()), lr=0.001)
     
     epochs = 20
@@ -170,38 +187,91 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
         np.random.shuffle(dataset)
         batch = dataset[:2000] 
         
-        for r1, r2, target_t_norm in batch:
+        for r1, r2, phys_info, target_t_norm in batch:
             optimizer.zero_grad()
             emb1, emb2 = encoder(r1), encoder(r2)
             sim = F.cosine_similarity(emb1, emb2)
             
-            predicted_norm = predictor(sim.unsqueeze(-1))
-            target_t = torch.tensor([float(target_t_norm)], dtype=torch.float32)
+            predicted_norm = predictor(sim, phys_info)
+            target_t = torch.tensor([[float(target_t_norm)]], dtype=torch.float32)
             
-            loss = F.mse_loss(predicted_norm.squeeze(), target_t.squeeze())
+            loss = F.mse_loss(predicted_norm, target_t)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             
         if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  - Epoch [{epoch+1:02d}/{epochs}] Avg MSE Loss (Normalized Time): {total_loss / len(batch):.4f}")
-            
+            print(f"  - Epoch [{epoch+1:02d}/{epochs}] Avg MSE Loss: {total_loss / len(batch):.4f}")
+
+    # ==========================================
+    # 🌟 [Phase 1-C] Predictor 심층 성능 검증 (신규 추가)
+    # ==========================================
     if len(dataset) >= 500:
+        print("\n" + "="*60)
+        print("📊 [심층 검증] 인코더 & Predictor 단독 성능 진단")
+        print("="*60)
         with torch.no_grad():
-            errors = []
-            for r1, r2, target_t_norm in dataset[-500:]:
+            preds, targets, sims = [], [], []
+            for r1, r2, phys_info, target_t_norm in dataset[-500:]:
                 emb1, emb2 = encoder(r1), encoder(r2)
                 sim = F.cosine_similarity(emb1, emb2)
-                pred_norm = predictor(sim.unsqueeze(-1)).item()
-                errors.append(abs(pred_norm - target_t_norm))
-            print(f"\n  [검증] Predictor MAE: {np.mean(errors):.4f} (Normalized Time 0~1 스케일)")
+                pred_norm = predictor(sim, phys_info).item()
+                
+                preds.append(pred_norm)
+                targets.append(target_t_norm)
+                sims.append(sim.item())
+                
+            preds = np.array(preds)
+            targets = np.array(targets)
+            sims = np.array(sims)
+            actual_times = targets * 30.0
+            
+            # 1. 유사도 변별력 확인
+            short_conn = sims[actual_times < 10.0]
+            long_conn = sims[actual_times >= 20.0]
+            mean_sim_short = np.mean(short_conn) if len(short_conn) > 0 else 0
+            mean_sim_long = np.mean(long_conn) if len(long_conn) > 0 else 0
+            print(f"✔️ 유사도 변별력 (긴 연결 vs 짧은 연결):")
+            print(f"   - 짧은 연결(<10초) 평균 유사도: {mean_sim_short:.3f}")
+            print(f"   - 긴 연결(>=20초) 평균 유사도: {mean_sim_long:.3f}")
+            print(f"   - 유사도 차이: {mean_sim_long - mean_sim_short:.3f} (목표: > 0.2)")
+
+            # 2. Binary Risk Detector 정확도 (Threshold = 0.4)
+            target_binary = (targets < 0.4).astype(int)
+            pred_binary = (preds < 0.4).astype(int)
+            accuracy = np.mean(target_binary == pred_binary) * 100
+            print(f"\n✔️ Binary 위험 감지 정확도 (Threshold=0.4): {accuracy:.1f}% (목표: > 70%)")
+            
+            # 3. 구간별 평균 절대 오차(MAE)
+            errs = np.abs(preds - targets) * 30.0 
+            idx_0_5 = (actual_times >= 0) & (actual_times < 5)
+            idx_5_15 = (actual_times >= 5) & (actual_times < 15)
+            idx_15_30 = (actual_times >= 15) & (actual_times <= 30)
+            
+            print(f"\n✔️ 구간별 평균 절대 오차 (MAE, 초 단위):")
+            print(f"   - [ 0~ 5초] 구간 오차: {np.mean(errs[idx_0_5]):.2f}초" if np.sum(idx_0_5) > 0 else "   - [0~5초] 데이터 없음")
+            print(f"   - [ 5~15초] 구간 오차: {np.mean(errs[idx_5_15]):.2f}초" if np.sum(idx_5_15) > 0 else "   - [5~15초] 데이터 없음")
+            print(f"   - [15~30초] 구간 오차: {np.mean(errs[idx_15_30]):.2f}초" if np.sum(idx_15_30) > 0 else "   - [15~30초] 데이터 없음")
+
+            # 4. 산점도(Scatter Plot) 시각화 및 저장
+            plt.figure(figsize=(7, 6))
+            plt.scatter(targets * 30.0, preds * 30.0, alpha=0.5, color='royalblue', edgecolors='w', s=60)
+            plt.plot([0, 30], [0, 30], 'r--', lw=2, label='Perfect Prediction (y=x)')
+            plt.title('Predictor Performance: Actual vs. Predicted $T_{conn}$', fontsize=14, fontweight='bold')
+            plt.xlabel('Actual Connection Time (sec)', fontsize=12)
+            plt.ylabel('Predicted Connection Time (sec)', fontsize=12)
+            plt.legend(fontsize=11)
+            plt.grid(True, linestyle='--', alpha=0.6)
+            plt.tight_layout()
+            plt.savefig('predictor_validation_scatter.png', dpi=300)
+            print(f"\n✔️ 산점도 그래프 저장 완료: 'predictor_validation_scatter.png'")
+            print("="*60 + "\n")
             
     for param in encoder.parameters(): param.requires_grad = False
     for param in predictor.parameters(): param.requires_grad = False
-    print("[Phase 1-B] 사전 학습 완료. 인코더 및 Predictor 가중치 고정됨.\n")
+    print("[Phase 1-B] 사전 학습 및 검증 완료. 모델 가중치 고정됨.\n")
     return encoder, predictor
 
-# A_v2x_master_module.py 파일 내 SumoV2XEnv 클래스 전체 덮어쓰기
 
 class SumoV2XEnv:
     def __init__(self, sumocfg_path, config: V2XConfig, pretrained_encoder=None, pretrained_predictor=None, sumo_seed=42):
@@ -241,14 +311,12 @@ class SumoV2XEnv:
             tv_route = traci.vehicle.getRoute(self.tv_id)
             tv_idx = traci.vehicle.getRouteIndex(self.tv_id)
             
-            # 현재 엣지 이후의 향후 경로만 비교 (현재 엣지는 제외)
             sv_future = sv_route[sv_idx+1 : sv_idx+4]
             tv_future = tv_route[tv_idx+1 : tv_idx+4]
             
             if not sv_future or not tv_future:
                 return physical_max
             
-            # 향후 경로의 겹침 비율로 GT 산출
             common = len(set(sv_future) & set(tv_future))
             total = max(len(sv_future), len(tv_future))
             ratio = common / max(total, 1) 
@@ -308,26 +376,30 @@ class SumoV2XEnv:
                 rel_speed_safe = max(rel_speed, 0.1)
                 max_time = min((100.0 - dist) / rel_speed_safe, 30.0)
                 
-                # 1. 환경 채점용 Ground Truth
                 self.T_conn_gt[sv_count] = self._estimate_actual_connection(vid, max_time)
                 
-                # 2. 마스킹용 Predicted 산출: Binary Risk Detector 적용
                 if self.config.use_embedding and self.encoder and self.predictor and tv_emb is not None:
                     sv_emb = self.encoder(sv_raw)
                     similarity = F.cosine_similarity(tv_emb, sv_emb)
-                    predicted_norm = self.predictor(similarity.unsqueeze(-1)).item()
                     
-                    # 사전학습 데이터 분포의 중앙값(Median) 부근을 참고하여 임계값 설정
+                    spd_tv, spd_sv = tv_raw[0][2].item() * 30.0, sv_raw[0][2].item() * 30.0
+                    rel_speed_dyn = abs(spd_tv - spd_sv) / 30.0
+                    dist_norm = dist / 100.0
+                    h_tv, h_sv = tv_raw[0][3].item(), sv_raw[0][3].item()
+                    heading_diff = abs(h_tv - h_sv)
+                    if heading_diff > 0.5: heading_diff = 1.0 - heading_diff
+                    
+                    phys_info = torch.FloatTensor([[dist_norm, rel_speed_dyn, heading_diff]])
+                    
+                    # 🌟 버그 수정 완료: unsqueeze(-1) 제거! (내부에서 차원 확장됨)
+                    predicted_norm = self.predictor(similarity, phys_info).item()
+                    
                     RISK_THRESHOLD = 0.40  
-                    
                     if predicted_norm < RISK_THRESHOLD:
-                        # [위험 감지] 이 차는 교차로에서 찢어질 확률이 높음. 보수적 필터링 적용
                         self.T_conn_predicted[sv_count] = min(max_time * 0.3, 30.0)
                     else:
-                        # [안전 판정] 이 차는 같이 갈 확률이 높음. Physical과 동일하게 낙관적 허용
                         self.T_conn_predicted[sv_count] = min(max_time, 30.0)
                 else:
-                    # Physical은 모든 차량을 낙관적으로 평가
                     self.T_conn_predicted[sv_count] = min(max_time, 30.0)
                 
                 sv_count += 1
