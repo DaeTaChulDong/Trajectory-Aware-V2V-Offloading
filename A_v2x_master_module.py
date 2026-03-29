@@ -256,7 +256,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             
             # 🌟 Weighted Loss: 짧은 연결 오차에 가중치 부여
             base_loss = F.mse_loss(predicted_norm, target_t, reduction='none')
-            weight = 2.0 if target_t_norm < 0.33 else (1.5 if target_t_norm < 0.67 else 1.0)
+            weight = 1.5 if target_t_norm < 0.33 else (1.3 if target_t_norm < 0.67 else 1.0)
             loss = (base_loss * weight).mean()
             
             loss.backward()
