@@ -201,15 +201,43 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
     print(f"[Phase 1-A] 완료. 총 {len(dataset)} 쌍의 실제 궤적 데이터 수집됨.")
     
     print("\n[Phase 1-B] 수집된 데이터로 인코더 및 Predictor 훈련 시작...")
+    
+    # 🌟 데이터 균형 맞추기 (오버샘플링)
+    short_data = [d for d in dataset if d[3] < 0.33]   # 10초 미만
+    mid_data = [d for d in dataset if 0.33 <= d[3] < 0.67]  # 10~20초
+    long_data = [d for d in dataset if d[3] >= 0.67]    # 20초 이상
+    
+    print(f"  [데이터 균형] 원본 분포: 짧은={len(short_data)}, 중간={len(mid_data)}, 긴={len(long_data)}")
+    
+    max_group = max(len(short_data), len(mid_data), len(long_data))
+    
+    if len(short_data) > 0:
+        short_oversampled = short_data * (max_group // len(short_data)) + \
+                           short_data[:max_group % len(short_data)]
+    else:
+        short_oversampled = []
+    
+    if len(mid_data) > 0:
+        mid_oversampled = mid_data * (max_group // len(mid_data)) + \
+                         mid_data[:max_group % len(mid_data)]
+    else:
+        mid_oversampled = []
+        
+    balanced_dataset = short_oversampled + mid_oversampled + long_data
+    print(f"  [데이터 균형] 균형 후: 짧은={len(short_oversampled)}, 중간={len(mid_oversampled)}, 긴={len(long_data)}, 총={len(balanced_dataset)}")
+    
     encoder = IntentionEncoder()
     predictor = ConnectionPredictor()
     optimizer = optim.Adam(list(encoder.parameters()) + list(predictor.parameters()), lr=0.001)
     
-    epochs = 20
+    # 🌟 에폭 수 증가 + 학습률 스케줄러 추가
+    epochs = 50
+    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    
     for epoch in range(epochs):
         total_loss = 0
-        np.random.shuffle(dataset)
-        batch = dataset[:2000] 
+        np.random.shuffle(balanced_dataset)
+        batch = balanced_dataset[:3000]
         
         for r1, r2, phys_info, target_t_norm in batch:
             optimizer.zero_grad()
@@ -223,10 +251,12 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
+        
+        scheduler.step()
             
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(f"  - Epoch [{epoch+1:02d}/{epochs}] Avg MSE Loss: {total_loss / len(batch):.4f}")
-
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"  - Epoch [{epoch+1:02d}/{epochs}] Avg MSE Loss: {total_loss / len(batch):.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+    
     # ==========================================
     # 🌟 [Phase 1-C] Predictor 심층 성능 검증 (신규 추가)
     # ==========================================
