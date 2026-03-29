@@ -9,7 +9,38 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Categorical
 import xml.etree.ElementTree as ET
-import matplotlib.pyplot as plt # 🌟 산점도 시각화를 위해 추가
+import matplotlib.pyplot as plt 
+import subprocess
+import socket
+import time
+
+SUMO_BINARY = "/opt/anaconda3/envs/v2v_rl/lib/python3.10/site-packages/sumo/bin/sumo"
+os.environ['SUMO_HOME'] = "/opt/anaconda3/envs/v2v_rl/lib/python3.10/site-packages/sumo/share/sumo"
+if 'SUMO_HOME' not in os.environ:
+    os.environ['SUMO_HOME'] = 'SUMO_HOME'
+tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
+if tools not in sys.path: sys.path.append(tools)
+
+import sumolib
+import traci
+
+def start_sumo_traci(sumocfg_path, sumo_binary=SUMO_BINARY):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))
+        port = s.getsockname()[1]
+    proc = subprocess.Popen(
+        [sumo_binary, "-c", sumocfg_path,
+         "--remote-port", str(port),
+         "--no-warnings", "--no-step-log", "--quit-on-end"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    for _ in range(30):
+        try:
+            traci.init(port=port)
+            return proc
+        except:
+            time.sleep(0.5)
+    raise RuntimeError("SUMO TraCI 연결 실패")
 
 def set_seed(seed=42):
     random.seed(seed)
@@ -17,13 +48,6 @@ def set_seed(seed=42):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-if 'SUMO_HOME' not in os.environ:
-    os.environ['SUMO_HOME'] = "/usr/local/opt/sumo/share/sumo" 
-tools = os.path.join(os.environ['SUMO_HOME'], 'tools')
-if tools not in sys.path: sys.path.append(tools)
-import sumolib
-import traci
 
 class V2XConfig:
     def __init__(self):
@@ -118,8 +142,8 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
     net_file_abs = os.path.join(os.path.dirname(sumocfg_path), net_file_rel)
     net = sumolib.net.readNet(net_file_abs)
     
-    traci.start(["sumo", "-c", sumocfg_path, "--seed", str(seed), "--no-warnings", "--no-step-log", "--quit-on-end"])
-    
+    sumo_proc = start_sumo_traci(sumocfg_path)
+
     active_pairs = {} 
     dataset = []      
     
@@ -208,7 +232,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
     # ==========================================
     if len(dataset) >= 500:
         print("\n" + "="*60)
-        print("📊 [심층 검증] 인코더 & Predictor 단독 성능 진단")
+        print(" [심층 검증] 인코더 & Predictor 단독 성능 진단")
         print("="*60)
         with torch.no_grad():
             preds, targets, sims = [], [], []
@@ -231,7 +255,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             long_conn = sims[actual_times >= 20.0]
             mean_sim_short = np.mean(short_conn) if len(short_conn) > 0 else 0
             mean_sim_long = np.mean(long_conn) if len(long_conn) > 0 else 0
-            print(f"✔️ 유사도 변별력 (긴 연결 vs 짧은 연결):")
+            print(f" 유사도 변별력 (긴 연결 vs 짧은 연결):")
             print(f"   - 짧은 연결(<10초) 평균 유사도: {mean_sim_short:.3f}")
             print(f"   - 긴 연결(>=20초) 평균 유사도: {mean_sim_long:.3f}")
             print(f"   - 유사도 차이: {mean_sim_long - mean_sim_short:.3f} (목표: > 0.2)")
@@ -240,7 +264,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             target_binary = (targets < 0.4).astype(int)
             pred_binary = (preds < 0.4).astype(int)
             accuracy = np.mean(target_binary == pred_binary) * 100
-            print(f"\n✔️ Binary 위험 감지 정확도 (Threshold=0.4): {accuracy:.1f}% (목표: > 70%)")
+            print(f"\n Binary 위험 감지 정확도 (Threshold=0.4): {accuracy:.1f}% (목표: > 70%)")
             
             # 3. 구간별 평균 절대 오차(MAE)
             errs = np.abs(preds - targets) * 30.0 
@@ -248,7 +272,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             idx_5_15 = (actual_times >= 5) & (actual_times < 15)
             idx_15_30 = (actual_times >= 15) & (actual_times <= 30)
             
-            print(f"\n✔️ 구간별 평균 절대 오차 (MAE, 초 단위):")
+            print(f"\n 구간별 평균 절대 오차 (MAE, 초 단위):")
             print(f"   - [ 0~ 5초] 구간 오차: {np.mean(errs[idx_0_5]):.2f}초" if np.sum(idx_0_5) > 0 else "   - [0~5초] 데이터 없음")
             print(f"   - [ 5~15초] 구간 오차: {np.mean(errs[idx_5_15]):.2f}초" if np.sum(idx_5_15) > 0 else "   - [5~15초] 데이터 없음")
             print(f"   - [15~30초] 구간 오차: {np.mean(errs[idx_15_30]):.2f}초" if np.sum(idx_15_30) > 0 else "   - [15~30초] 데이터 없음")
@@ -264,7 +288,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             plt.grid(True, linestyle='--', alpha=0.6)
             plt.tight_layout()
             plt.savefig('predictor_validation_scatter.png', dpi=300)
-            print(f"\n✔️ 산점도 그래프 저장 완료: 'predictor_validation_scatter.png'")
+            print(f"\n 산점도 그래프 저장 완료: 'predictor_validation_scatter.png'")
             print("="*60 + "\n")
             
     for param in encoder.parameters(): param.requires_grad = False
@@ -283,7 +307,7 @@ class SumoV2XEnv:
         self.predictor = pretrained_predictor
         self.sim_seed = sumo_seed 
         
-        self.reload_count = 0 
+        self.reload_count = 0
         
         tree = ET.parse(sumocfg_path)
         net_file_rel = tree.find('.//net-file').get('value')
@@ -295,10 +319,12 @@ class SumoV2XEnv:
 
         self.T_conn_gt = np.zeros(self.config.max_svs)
         self.T_conn_predicted = np.zeros(self.config.max_svs)
-        
+
     def start_sumo(self, gui=False):
-        binary = "sumo-gui" if gui else "sumo"
-        sumo_cmd = [binary, "-c", self.sumocfg_path, "--seed", str(self.sim_seed), "--no-warnings", "--no-step-log", "--quit-on-end"]
+        self.sumo_proc = start_sumo_traci(self.sumocfg_path)
+        binary = SUMO_BINARY
+        sumo_cmd = [binary, "-c", self.sumocfg_path, "--seed", str(self.sim_seed), 
+                "--no-warnings", "--no-step-log", "--quit-on-end"]
         traci.start(sumo_cmd)
         
     def close_sumo(self):
@@ -391,7 +417,7 @@ class SumoV2XEnv:
                     
                     phys_info = torch.FloatTensor([[dist_norm, rel_speed_dyn, heading_diff]])
                     
-                    # 🌟 버그 수정 완료: unsqueeze(-1) 제거! (내부에서 차원 확장됨)
+                    # 버그 수정 완료: unsqueeze(-1) 제거! (내부에서 차원 확장됨)
                     predicted_norm = self.predictor(similarity, phys_info).item()
                     
                     RISK_THRESHOLD = 0.40  
