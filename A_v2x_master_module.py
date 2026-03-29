@@ -202,10 +202,10 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
     
     print("\n[Phase 1-B] 수집된 데이터로 인코더 및 Predictor 훈련 시작...")
     
-    # 🌟 데이터 균형 맞추기 (오버샘플링)
-    short_data = [d for d in dataset if d[3] < 0.33]   # 10초 미만
-    mid_data = [d for d in dataset if 0.33 <= d[3] < 0.67]  # 10~20초
-    long_data = [d for d in dataset if d[3] >= 0.67]    # 20초 이상
+    # 데이터 균형 맞추기 (오버샘플링)
+    short_data = [d for d in dataset if d[3] < 0.33]
+    mid_data = [d for d in dataset if 0.33 <= d[3] < 0.67]
+    long_data = [d for d in dataset if d[3] >= 0.67]
     
     print(f"  [데이터 균형] 원본 분포: 짧은={len(short_data)}, 중간={len(mid_data)}, 긴={len(long_data)}")
     
@@ -226,18 +226,25 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
     balanced_dataset = short_oversampled + mid_oversampled + long_data
     print(f"  [데이터 균형] 균형 후: 짧은={len(short_oversampled)}, 중간={len(mid_oversampled)}, 긴={len(long_data)}, 총={len(balanced_dataset)}")
     
+    # 🌟 개선 1: 인코더 구조 강화 (Dropout 추가로 과적합 방지)
     encoder = IntentionEncoder()
     predictor = ConnectionPredictor()
-    optimizer = optim.Adam(list(encoder.parameters()) + list(predictor.parameters()), lr=0.001)
+    optimizer = optim.Adam(list(encoder.parameters()) + list(predictor.parameters()), lr=0.0005)
     
-    # 🌟 에폭 수 증가 + 학습률 스케줄러 추가
-    epochs = 50
-    scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=20, gamma=0.5)
+    # 🌟 개선 2: 에폭 100 + 코사인 스케줄러 (더 부드러운 학습률 감소)
+    epochs = 100
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
+    
+    # 🌟 개선 3: 짧은 연결에 더 큰 가중치를 주는 Weighted MSE Loss
+    best_loss = float('inf')
+    patience_counter = 0
+    best_encoder_state = None
+    best_predictor_state = None
     
     for epoch in range(epochs):
         total_loss = 0
         np.random.shuffle(balanced_dataset)
-        batch = balanced_dataset[:3000]
+        batch = balanced_dataset[:4000]
         
         for r1, r2, phys_info, target_t_norm in batch:
             optimizer.zero_grad()
@@ -247,15 +254,41 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
             predicted_norm = predictor(sim, phys_info)
             target_t = torch.tensor([[float(target_t_norm)]], dtype=torch.float32)
             
-            loss = F.mse_loss(predicted_norm, target_t)
+            # 🌟 Weighted Loss: 짧은 연결 오차에 가중치 부여
+            base_loss = F.mse_loss(predicted_norm, target_t, reduction='none')
+            weight = 2.0 if target_t_norm < 0.33 else (1.5 if target_t_norm < 0.67 else 1.0)
+            loss = (base_loss * weight).mean()
+            
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
         
         scheduler.step()
+        avg_loss = total_loss / len(batch)
+        
+        # 🌟 개선 4: Early Stopping + Best Model 저장
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            patience_counter = 0
+            best_encoder_state = {k: v.clone() for k, v in encoder.state_dict().items()}
+            best_predictor_state = {k: v.clone() for k, v in predictor.state_dict().items()}
+        else:
+            patience_counter += 1
             
         if (epoch + 1) % 10 == 0 or epoch == 0:
-            print(f"  - Epoch [{epoch+1:02d}/{epochs}] Avg MSE Loss: {total_loss / len(batch):.4f}, LR: {scheduler.get_last_lr()[0]:.6f}")
+            print(f"  - Epoch [{epoch+1:03d}/{epochs}] Avg Loss: {avg_loss:.4f}, "
+                  f"LR: {scheduler.get_last_lr()[0]:.6f}, Best: {best_loss:.4f}, "
+                  f"Patience: {patience_counter}/20")
+        
+        if patience_counter >= 20:
+            print(f"  ⏹ Early Stopping at Epoch {epoch+1} (20 에폭 연속 개선 없음)")
+            break
+    
+    # 🌟 Best Model 복원
+    if best_encoder_state is not None:
+        encoder.load_state_dict(best_encoder_state)
+        predictor.load_state_dict(best_predictor_state)
+        print(f"  ✅ Best Model 복원 완료 (Loss: {best_loss:.4f})")
     
     # ==========================================
     # 🌟 [Phase 1-C] Predictor 심층 성능 검증 (신규 추가)
