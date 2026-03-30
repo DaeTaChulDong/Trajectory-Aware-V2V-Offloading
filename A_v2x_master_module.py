@@ -24,10 +24,24 @@ if tools not in sys.path: sys.path.append(tools)
 import sumolib
 import traci
 
+_sumo_label_counter = 0
+
 def start_sumo_traci(sumocfg_path, sumo_binary=SUMO_BINARY):
+    global _sumo_label_counter
+    
+    # 기존 연결 정리
+    try:
+        traci.close()
+    except:
+        pass
+    
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(('', 0))
         port = s.getsockname()[1]
+    
+    _sumo_label_counter += 1
+    label = f"sumo_{_sumo_label_counter}"
+    
     proc = subprocess.Popen(
         [sumo_binary, "-c", sumocfg_path,
          "--remote-port", str(port),
@@ -36,7 +50,8 @@ def start_sumo_traci(sumocfg_path, sumo_binary=SUMO_BINARY):
     )
     for _ in range(30):
         try:
-            traci.init(port=port)
+            traci.init(port=port, label=label)
+            traci.switch(label)
             return proc
         except:
             time.sleep(0.5)
@@ -174,7 +189,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
                         target_t_norm = min(actual_conn_time, 30.0) / 30.0
                         dataset.append((r1, r2, phys_info, target_t_norm))
             
-            if len(veh_ids) >= 2:
+            if len(veh_ids) >= 10:
                 sample_size = min(len(veh_ids), 20)
                 sampled_vids = np.random.choice(veh_ids, sample_size, replace=False)
                 for i in range(len(sampled_vids)):
@@ -385,10 +400,6 @@ class SumoV2XEnv:
 
     def start_sumo(self, gui=False):
         self.sumo_proc = start_sumo_traci(self.sumocfg_path)
-        binary = SUMO_BINARY
-        sumo_cmd = [binary, "-c", self.sumocfg_path, "--seed", str(self.sim_seed), 
-                "--no-warnings", "--no-step-log", "--quit-on-end"]
-        traci.start(sumo_cmd)
         
     def close_sumo(self):
         traci.close()
@@ -416,7 +427,8 @@ class SumoV2XEnv:
 
     def reset(self):
         veh_ids = []
-        while len(veh_ids) < 2:
+        MIN_VEHICLES = 30
+        while len(veh_ids) < MIN_VEHICLES:
             traci.simulationStep()
             if traci.simulation.getMinExpectedNumber() <= 0:
                 self.reload_count += 1
@@ -448,7 +460,15 @@ class SumoV2XEnv:
             dist = max(5.0, math.hypot(pos1[0] - pos2[0], pos1[1] - pos2[1])) 
             
             if dist <= self.config.comm_range:
+                # 🌟 거리가 너무 먼 SV는 제외 (T_conn이 너무 짧아 오프로딩 불가능)
+                rel_speed_check = abs(tv_raw[0][2].item() - sv_raw[0][2].item()) * 30.0
+                rel_speed_check = max(rel_speed_check, 0.1)
+                max_time_check = (self.config.comm_range - dist) / rel_speed_check
+                if max_time_check < 2.0:
+                    continue  # 물리적으로 2초도 안 되는 SV는 건너뜀
+                
                 self.sv_list.append(vid)
+
                 self.f_sv[sv_count] = np.random.uniform(self.config.f_sv_min, self.config.f_sv_max)
                 
                 pl_db = self.config.pl_ref + 10.0 * self.config.path_loss_exp * math.log10(dist)
@@ -554,6 +574,20 @@ class SumoV2XEnv:
         }
         traci.simulationStep()
         return next_state, reward, done, info
+    
+def get_current_sv_info(self):
+        """현재 reset() 상태의 SV 정보를 반환 (공정 비교용)"""
+        return {
+            'tv_id': self.tv_id,
+            'sv_list': list(self.sv_list),
+            'f_sv': self.f_sv.copy(),
+            'R_sv': self.R_sv.copy(),
+            'T_conn_gt': self.T_conn_gt.copy(),
+            'T_conn_predicted': self.T_conn_predicted.copy(),
+            'task': dict(self.task),
+            'num_svs': self.last_num_svs,
+            'action_mask': self.last_action_mask.copy()
+        }
 
 class FullPPOAgent(nn.Module):
     def __init__(self, state_dim, action_dim, config: V2XConfig):
