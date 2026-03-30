@@ -149,7 +149,7 @@ def _get_raw_features(vid, net):
         
     return torch.FloatTensor([[pos[0]/500.0, pos[1]/500.0, speed/30.0, heading, dest_x/500.0, dest_y/500.0]])
 
-def pretrain_intention_encoder(sumocfg_path, num_steps=5000, seed=42):
+def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     print("\n[Phase 1-A] SUMO 시뮬레이션에서 실제 연결 지속 시간(Actual T_conn) 데이터 수집 중...")
     
     tree = ET.parse(sumocfg_path)
@@ -427,7 +427,7 @@ class SumoV2XEnv:
 
     def reset(self):
         veh_ids = []
-        MIN_VEHICLES = 30
+        MIN_VEHICLES = 55
         while len(veh_ids) < MIN_VEHICLES:
             traci.simulationStep()
             if traci.simulation.getMinExpectedNumber() <= 0:
@@ -575,7 +575,7 @@ class SumoV2XEnv:
         traci.simulationStep()
         return next_state, reward, done, info
     
-def get_current_sv_info(self):
+    def get_current_sv_info(self):
         """현재 reset() 상태의 SV 정보를 반환 (공정 비교용)"""
         return {
             'tv_id': self.tv_id,
