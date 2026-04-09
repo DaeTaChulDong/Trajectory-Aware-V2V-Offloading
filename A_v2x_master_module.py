@@ -122,17 +122,53 @@ class IntentionEncoder(nn.Module):
 class ConnectionPredictor(nn.Module):
     def __init__(self):
         super(ConnectionPredictor, self).__init__()
-        # 입력 차원 4: [cosine_similarity, dist_norm, rel_speed_norm, heading_diff_norm]
+        # 입력 차원 5: [cosine_similarity, dist_norm, rel_speed_norm, heading_diff_norm, shared_path_prob]
         self.net = nn.Sequential(
-            nn.Linear(4, 32), nn.ReLU(),
+            nn.Linear(5, 32), nn.ReLU(),
             nn.Linear(32, 16), nn.ReLU(),
             nn.Linear(16, 1), nn.Sigmoid()
         )
-    
-    def forward(self, similarity, phys_info):
-        # similarity는 1D 텐서이므로 차원을 늘려 결합
-        x = torch.cat([similarity.unsqueeze(-1), phys_info], dim=-1)
+
+    def forward(self, similarity, phys_info, shared_path_prob):
+        x = torch.cat([similarity.unsqueeze(-1), phys_info, shared_path_prob.unsqueeze(-1)], dim=-1)
         return self.net(x)
+
+class TrajectoryPredictor(nn.Module):
+    """차량의 6D 특징 → 다음 교차로 진행 방향 확률 [직진, 좌회전, 우회전]"""
+    def __init__(self, input_dim=6, num_directions=3):
+        super(TrajectoryPredictor, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.ReLU(),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, num_directions)
+        )
+
+    def forward(self, x):
+        return F.softmax(self.net(x), dim=-1)
+
+def _get_edge_heading(edge_id, net):
+    """에지의 compass bearing (0=North, clockwise) 반환"""
+    try:
+        edge = net.getEdge(edge_id)
+        from_coord = edge.getFromNode().getCoord()
+        to_coord = edge.getToNode().getCoord()
+        dx = to_coord[0] - from_coord[0]
+        dy = to_coord[1] - from_coord[1]
+        return math.degrees(math.atan2(dx, dy)) % 360
+    except:
+        return 0.0
+
+def _get_junction_direction(prev_edge_id, curr_edge_id, net):
+    """이전 에지→현재 에지 전환 방향 분류: 0=직진, 1=좌회전, 2=우회전"""
+    prev_h = _get_edge_heading(prev_edge_id, net)
+    curr_h = _get_edge_heading(curr_edge_id, net)
+    diff = (curr_h - prev_h + 360) % 360
+    if diff < 45 or diff >= 315:
+        return 0  # 직진
+    elif diff < 180:
+        return 2  # 우회전
+    else:
+        return 1  # 좌회전
 
 def _get_raw_features(vid, net):
     pos = traci.vehicle.getPosition(vid)
@@ -159,9 +195,11 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     
     sumo_proc = start_sumo_traci(sumocfg_path)
 
-    active_pairs = {} 
-    dataset = []      
-    
+    active_pairs = {}
+    dataset = []
+    junction_dataset = []   # (features_6d, direction_int) 교차로 통과 데이터
+    prev_edge_dict = {}     # vid -> (edge_id, raw_features) 에지 변화 추적
+
     try:
         for step in range(num_steps):
             traci.simulationStep()
@@ -170,7 +208,23 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
             veh_ids = traci.vehicle.getIDList()
             current_time = traci.simulation.getTime()
             pos_dict = {vid: traci.vehicle.getPosition(vid) for vid in veh_ids}
-            
+
+            # 교차로 통과 감지: 에지 변화 추적
+            for vid in veh_ids:
+                curr_edge = traci.vehicle.getRoadID(vid)
+                if not curr_edge or curr_edge.startswith(':'):
+                    prev_edge_dict.pop(vid, None)
+                    continue
+                if vid in prev_edge_dict:
+                    prev_edge_id, prev_feat = prev_edge_dict[vid]
+                    if curr_edge != prev_edge_id:
+                        direction = _get_junction_direction(prev_edge_id, curr_edge, net)
+                        junction_dataset.append((prev_feat, direction))
+                prev_edge_dict[vid] = (curr_edge, _get_raw_features(vid, net))
+            for vid in list(prev_edge_dict.keys()):
+                if vid not in pos_dict:
+                    prev_edge_dict.pop(vid, None)
+
             ended_pairs = []
             for (v1, v2), (start_t, r1, r2, phys_info) in active_pairs.items():
                 both_alive = (v1 in pos_dict and v2 in pos_dict)
@@ -214,7 +268,53 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
         traci.close()
         
     print(f"[Phase 1-A] 완료. 총 {len(dataset)} 쌍의 실제 궤적 데이터 수집됨.")
-    
+    print(f"           교차로 통과 데이터: {len(junction_dataset)}건 수집됨.")
+
+    print("\n[Phase 1-B-1] TrajectoryPredictor 훈련 시작...")
+    traj_predictor = TrajectoryPredictor()
+    if len(junction_dataset) >= 50:
+        traj_optimizer = optim.Adam(traj_predictor.parameters(), lr=0.001)
+        traj_criterion = nn.CrossEntropyLoss()
+
+        straight  = [d for d in junction_dataset if d[1] == 0]
+        left_turn = [d for d in junction_dataset if d[1] == 1]
+        right_turn= [d for d in junction_dataset if d[1] == 2]
+        print(f"  [방향 분포] 직진={len(straight)}, 좌회전={len(left_turn)}, 우회전={len(right_turn)}")
+
+        traj_epochs = 60
+        best_traj_loss, best_traj_state, traj_patience = float('inf'), None, 0
+        for epoch in range(traj_epochs):
+            np.random.shuffle(junction_dataset)
+            total_loss = 0
+            for feat, direction in junction_dataset:
+                traj_optimizer.zero_grad()
+                logits = traj_predictor.net(feat)           # raw logits (CrossEntropyLoss 용)
+                target = torch.LongTensor([direction])
+                loss = traj_criterion(logits, target)
+                loss.backward()
+                traj_optimizer.step()
+                total_loss += loss.item()
+            avg = total_loss / len(junction_dataset)
+            if avg < best_traj_loss:
+                best_traj_loss = avg
+                traj_patience = 0
+                best_traj_state = {k: v.clone() for k, v in traj_predictor.state_dict().items()}
+            else:
+                traj_patience += 1
+            if (epoch + 1) % 10 == 0 or epoch == 0:
+                print(f"  - Traj Epoch [{epoch+1:02d}/{traj_epochs}] Loss: {avg:.4f}, Best: {best_traj_loss:.4f}")
+            if traj_patience >= 15:
+                print(f"  ⏹ Traj Early Stopping at Epoch {epoch+1}")
+                break
+        if best_traj_state is not None:
+            traj_predictor.load_state_dict(best_traj_state)
+            print(f"  ✅ TrajectoryPredictor Best Model 복원 (Loss: {best_traj_loss:.4f})")
+    else:
+        print(f"  ⚠ 교차로 데이터 부족({len(junction_dataset)}건). 균등 초기화로 진행.")
+    for param in traj_predictor.parameters():
+        param.requires_grad = False
+    print("[Phase 1-B-1] TrajectoryPredictor 학습 완료. 가중치 고정됨.\n")
+
     print("\n[Phase 1-B] 수집된 데이터로 인코더 및 Predictor 훈련 시작...")
     
     # 데이터 균형 맞추기 (오버샘플링)
@@ -245,28 +345,37 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     encoder = IntentionEncoder()
     predictor = ConnectionPredictor()
     optimizer = optim.Adam(list(encoder.parameters()) + list(predictor.parameters()), lr=0.0005)
-    
+
     # 🌟 개선 2: 에폭 100 + 코사인 스케줄러 (더 부드러운 학습률 감소)
     epochs = 100
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
-    
+
+    # frozen traj_predictor로 balanced_dataset에 shared_path_prob 추가
+    with torch.no_grad():
+        enriched_dataset = []
+        for r1, r2, phys_info, target_t_norm in balanced_dataset:
+            tv_dir = traj_predictor(r1)
+            sv_dir = traj_predictor(r2)
+            spp = (tv_dir * sv_dir).sum(dim=-1)
+            enriched_dataset.append((r1, r2, phys_info, target_t_norm, spp))
+
     # 🌟 개선 3: 짧은 연결에 더 큰 가중치를 주는 Weighted MSE Loss
     best_loss = float('inf')
     patience_counter = 0
     best_encoder_state = None
     best_predictor_state = None
-    
+
     for epoch in range(epochs):
         total_loss = 0
-        np.random.shuffle(balanced_dataset)
-        batch = balanced_dataset[:4000]
-        
-        for r1, r2, phys_info, target_t_norm in batch:
+        np.random.shuffle(enriched_dataset)
+        batch = enriched_dataset[:4000]
+
+        for r1, r2, phys_info, target_t_norm, spp in batch:
             optimizer.zero_grad()
             emb1, emb2 = encoder(r1), encoder(r2)
             sim = F.cosine_similarity(emb1, emb2)
-            
-            predicted_norm = predictor(sim, phys_info)
+
+            predicted_norm = predictor(sim, phys_info, spp)
             target_t = torch.tensor([[float(target_t_norm)]], dtype=torch.float32)
             
             # 🌟 Weighted Loss: 짧은 연결 오차에 가중치 부여
@@ -317,7 +426,10 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
             for r1, r2, phys_info, target_t_norm in dataset[-500:]:
                 emb1, emb2 = encoder(r1), encoder(r2)
                 sim = F.cosine_similarity(emb1, emb2)
-                pred_norm = predictor(sim, phys_info).item()
+                tv_dir = traj_predictor(r1)
+                sv_dir = traj_predictor(r2)
+                spp = (tv_dir * sv_dir).sum(dim=-1)
+                pred_norm = predictor(sim, phys_info, spp).item()
                 
                 preds.append(pred_norm)
                 targets.append(target_t_norm)
@@ -372,18 +484,19 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     for param in encoder.parameters(): param.requires_grad = False
     for param in predictor.parameters(): param.requires_grad = False
     print("[Phase 1-B] 사전 학습 및 검증 완료. 모델 가중치 고정됨.\n")
-    return encoder, predictor
+    return encoder, predictor, traj_predictor
 
 
 class SumoV2XEnv:
-    def __init__(self, sumocfg_path, config: V2XConfig, pretrained_encoder=None, pretrained_predictor=None, sumo_seed=42):
+    def __init__(self, sumocfg_path, config: V2XConfig, pretrained_encoder=None, pretrained_predictor=None, pretrained_trajectory_predictor=None, sumo_seed=42):
         self.sumocfg_path = sumocfg_path
         self.config = config
-        self.state_dim = 2 + (self.config.max_svs * 3) 
-        self.action_dim = self.config.max_svs + 1      
+        self.state_dim = 2 + (self.config.max_svs * 3)
+        self.action_dim = self.config.max_svs + 1
         self.encoder = pretrained_encoder
         self.predictor = pretrained_predictor
-        self.sim_seed = sumo_seed 
+        self.traj_predictor = pretrained_trajectory_predictor
+        self.sim_seed = sumo_seed
         
         self.reload_count = 0
         
@@ -421,7 +534,8 @@ class SumoV2XEnv:
             total = max(len(sv_future), len(tv_future))
             ratio = common / max(total, 1) 
             
-            return physical_max * max(0.3, ratio)
+            # 수정: 겹침이 0이면 GT를 매우 짧게 (기존 0.3 → 0.1)
+            return physical_max * max(0.1, ratio)
         except:
             return physical_max
 
@@ -460,12 +574,7 @@ class SumoV2XEnv:
             dist = max(5.0, math.hypot(pos1[0] - pos2[0], pos1[1] - pos2[1])) 
             
             if dist <= self.config.comm_range:
-                # 🌟 거리가 너무 먼 SV는 제외 (T_conn이 너무 짧아 오프로딩 불가능)
-                rel_speed_check = abs(tv_raw[0][2].item() - sv_raw[0][2].item()) * 30.0
-                rel_speed_check = max(rel_speed_check, 0.1)
-                max_time_check = (self.config.comm_range - dist) / rel_speed_check
-                if max_time_check < 2.0:
-                    continue  # 물리적으로 2초도 안 되는 SV는 건너뜀
+                
                 
                 self.sv_list.append(vid)
 
@@ -490,20 +599,27 @@ class SumoV2XEnv:
                 if self.config.use_embedding and self.encoder and self.predictor and tv_emb is not None:
                     sv_emb = self.encoder(sv_raw)
                     similarity = F.cosine_similarity(tv_emb, sv_emb)
-                    
+
                     spd_tv, spd_sv = tv_raw[0][2].item() * 30.0, sv_raw[0][2].item() * 30.0
                     rel_speed_dyn = abs(spd_tv - spd_sv) / 30.0
                     dist_norm = dist / 100.0
                     h_tv, h_sv = tv_raw[0][3].item(), sv_raw[0][3].item()
                     heading_diff = abs(h_tv - h_sv)
                     if heading_diff > 0.5: heading_diff = 1.0 - heading_diff
-                    
+
                     phys_info = torch.FloatTensor([[dist_norm, rel_speed_dyn, heading_diff]])
-                    
-                    # 버그 수정 완료: unsqueeze(-1) 제거! (내부에서 차원 확장됨)
-                    predicted_norm = self.predictor(similarity, phys_info).item()
-                    
-                    RISK_THRESHOLD = 0.40  
+
+                    if self.traj_predictor is not None:
+                        with torch.no_grad():
+                            tv_dir_probs = self.traj_predictor(tv_raw)          # [1, 3]
+                            sv_dir_probs = self.traj_predictor(sv_raw)          # [1, 3]
+                            shared_path_prob = (tv_dir_probs * sv_dir_probs).sum(dim=-1)  # [1]
+                    else:
+                        shared_path_prob = torch.tensor([1.0 / 3.0])
+
+                    predicted_norm = self.predictor(similarity, phys_info, shared_path_prob).item()
+
+                    RISK_THRESHOLD = 0.60
                     if predicted_norm < RISK_THRESHOLD:
                         self.T_conn_predicted[sv_count] = min(max_time * 0.3, 30.0)
                     else:
@@ -669,7 +785,7 @@ class GreedySNRAgent:
         if len(valid_actions) == 0: return torch.tensor(0), None, None
             
         best_sv_idx = valid_actions[np.argmax(R_sv_array[valid_actions])]
-        return torch.tensor(best_sv_idx + 1), None, None
+        return torch.tensor(int(best_sv_idx) + 1), None, None
 
 class GreedyCPUAgent:
     def __init__(self, state_dim, action_dim, config):
@@ -685,7 +801,7 @@ class GreedyCPUAgent:
         if len(valid_actions) == 0: return torch.tensor(0), None, None
             
         best_sv_idx = valid_actions[np.argmax(f_sv_array[valid_actions])]
-        return torch.tensor(best_sv_idx + 1), None, None
+        return torch.tensor(int(best_sv_idx) + 1), None, None
 
 class GreedyStabilityAgent:
     def __init__(self, state_dim, action_dim, config):
@@ -703,4 +819,4 @@ class GreedyStabilityAgent:
             return torch.tensor(0), None, None
             
         best_sv_idx = valid_actions[np.argmax(T_conn_array[valid_actions])]
-        return torch.tensor(best_sv_idx + 1), None, None
+        return torch.tensor(int(best_sv_idx) + 1), None, None
