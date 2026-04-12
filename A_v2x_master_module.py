@@ -90,11 +90,11 @@ class V2XConfig:
         self.critic_lr = 1e-3
         self.max_grad_norm = 0.5   
         self.task_types = [
-            {'name': 'Type 1', 'prob': 0.3, 'D': 50.0, 'C': 10.0, 'T_max': 10.0},
-            {'name': 'Type 2', 'prob': 0.1, 'D': 200.0, 'C': 200.0, 'T_max': 15.0},
-            {'name': 'Type 3', 'prob': 0.1, 'D': 10.0, 'C': 5.0, 'T_max': 5.0},
-            {'name': 'Type 4', 'prob': 0.3, 'D': 100.0, 'C': 300.0, 'T_max': 20.0},
-            {'name': 'Type 5', 'prob': 0.2, 'D': 300.0, 'C': 100.0, 'T_max': 10.0}
+            {'name': 'Type 1', 'prob': 0.3, 'D': 30.0,  'C': 10.0,  'T_max': 15.0},
+            {'name': 'Type 2', 'prob': 0.1, 'D': 100.0, 'C': 100.0, 'T_max': 20.0},
+            {'name': 'Type 3', 'prob': 0.1, 'D': 10.0,  'C': 5.0,   'T_max': 10.0},
+            {'name': 'Type 4', 'prob': 0.3, 'D': 50.0,  'C': 150.0, 'T_max': 25.0},
+            {'name': 'Type 5', 'prob': 0.2, 'D': 150.0, 'C': 50.0,  'T_max': 15.0}
         ]
 
 class RolloutBuffer:
