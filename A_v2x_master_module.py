@@ -510,6 +510,7 @@ class SumoV2XEnv:
 
         self.T_conn_gt = np.zeros(self.config.max_svs)
         self.T_conn_predicted = np.zeros(self.config.max_svs)
+        self.shared_path_probs = np.zeros(self.config.max_svs)
 
     def start_sumo(self, gui=False):
         self.sumo_proc = start_sumo_traci(self.sumocfg_path)
@@ -529,11 +530,6 @@ class SumoV2XEnv:
             
             if not sv_future or not tv_future:
                 return physical_max
-            
-            # 핵심 수정: 다음 엣지가 다르면 즉시 이탈로 판정
-            if sv_future[0] != tv_future[0]:
-                # 다음 교차로에서 갈라짐 → GT를 매우 짧게
-                return min(physical_max * 0.25, 6.0)
             
             # 다음 엣지는 같으나 그 이후가 다른 경우
             common = len(set(sv_future) & set(tv_future))
@@ -569,6 +565,7 @@ class SumoV2XEnv:
         self.sv_list, self.f_sv, self.R_sv = [], np.zeros(self.config.max_svs), np.zeros(self.config.max_svs)
         self.T_conn_gt.fill(0)
         self.T_conn_predicted.fill(0)
+        self.shared_path_probs.fill(0)
         
         sv_count = 0
         for vid in veh_ids:
@@ -624,22 +621,25 @@ class SumoV2XEnv:
 
                     predicted_norm = self.predictor(similarity, phys_info, shared_path_prob).item()
 
-                    RISK_THRESHOLD = 0.40
-                    if predicted_norm < RISK_THRESHOLD:
-                        self.T_conn_predicted[sv_count] = min(max_time * 0.3, 30.0)
-                    else:
-                        self.T_conn_predicted[sv_count] = min(max_time, 30.0)
+                    # State 증강: shared_path_prob를 T_conn 슬롯에 저장
+                    # 마스킹은 Physical과 동일하게 max_time 기반
+                    self.T_conn_predicted[sv_count] = min(max_time, 30.0)  # 마스킹용 (Physical과 동일)
+                    self.shared_path_probs[sv_count] = shared_path_prob.item()  # State 증강용
                 else:
                     self.T_conn_predicted[sv_count] = min(max_time, 30.0)
-                
+                    self.shared_path_probs[sv_count] = 1.0  # 인코더 없으면 중립값
+
                 sv_count += 1
                 
         state = np.zeros(self.state_dim, dtype=np.float32)
         state[0], state[1] = self.task['D'] / 100.0, self.task['C'] / 100.0
         state[2:2+self.config.max_svs] = self.f_sv / 50.0
         state[2+self.config.max_svs:2+2*self.config.max_svs] = self.R_sv / 100.0
-        state[2+2*self.config.max_svs:] = self.T_conn_predicted / 30.0
-        
+        if self.config.use_embedding:
+            state[2+2*self.config.max_svs:] = self.shared_path_probs  # 0~1 경로공유확률
+        else:
+            state[2+2*self.config.max_svs:] = self.T_conn_predicted / 30.0  # Physical: max_time
+
         action_mask = np.ones(self.action_dim, dtype=np.float32) 
         if self.config.use_masking:
             action_mask = np.zeros(self.action_dim, dtype=np.float32)
