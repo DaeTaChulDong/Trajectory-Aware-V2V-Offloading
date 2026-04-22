@@ -90,11 +90,20 @@ class V2XConfig:
         self.critic_lr = 1e-3
         self.max_grad_norm = 0.5   
         self.task_types = [
-            {'name': 'Type 1', 'prob': 0.30, 'D': 100.0, 'C': 100.0, 'T_max': 12.0},
-            {'name': 'Type 2', 'prob': 0.20, 'D': 200.0, 'C': 50.0,  'T_max': 15.0},
-            {'name': 'Type 3', 'prob': 0.20, 'D': 50.0,  'C': 250.0, 'T_max': 15.0},
-            {'name': 'Type 4', 'prob': 0.15, 'D': 150.0, 'C': 200.0, 'T_max': 18.0},
-            {'name': 'Type 5', 'prob': 0.15, 'D': 50.0,  'C': 50.0,  'T_max': 8.0},
+            # Type 1: 평균 소요 10초 (가장 기본 태스크, 꺾어지면 아슬아슬하게 실패)
+            {'name': 'Type 1', 'prob': 0.3, 'D': 150.0, 'C': 150.0, 'T_max': 16.0},
+            
+            # Type 2: 평균 소요 11.6초 (전송량 많음, 직진 차를 못 고르면 실패)
+            {'name': 'Type 2', 'prob': 0.1, 'D': 250.0, 'C': 100.0, 'T_max': 18.0},
+            
+            # Type 3: 평균 소요 11.6초 (연산량 많음, 직진 차를 못 고르면 실패)
+            {'name': 'Type 3', 'prob': 0.1, 'D': 100.0, 'C': 250.0, 'T_max': 18.0},
+            
+            # Type 4: 평균 소요 13.3초 (가장 무거운 태스크, 완벽한 SV 매칭 필수)
+            {'name': 'Type 4', 'prob': 0.3, 'D': 200.0, 'C': 200.0, 'T_max': 20.0},
+            
+            # Type 5: 평균 소요 6.6초 (가벼운 태스크, 전체 성공률의 바닥을 지지)
+            {'name': 'Type 5', 'prob': 0.2, 'D': 100.0, 'C': 100.0, 'T_max': 10.0}
         ]
 
 class RolloutBuffer:
@@ -657,23 +666,32 @@ class SumoV2XEnv:
     def step(self, action):
         D_i, C_i, T_max = self.task['D'], self.task['C'], self.task['T_max']
         is_failed = False
+        fail_reason = 'none'  # 추가
         t_trans, t_comp, e_trans, e_comp = 0.0, 0.0, 0.0, 0.0
         
         if action == 0:
             t_comp = C_i / self.config.f_tv
             e_comp = self.config.kappa * C_i * (self.config.f_tv ** 2) 
-            if t_comp > T_max: is_failed = True
+            if t_comp > T_max: 
+                is_failed = True
+                fail_reason = 'local_deadline'  # 추가
         else:
             sv_idx = action - 1
-            if sv_idx >= len(self.sv_list): is_failed = True
+            if sv_idx >= len(self.sv_list): 
+                is_failed = True
+                fail_reason = 'invalid_sv'  # 추가
             else:
                 t_trans = D_i / self.R_sv[sv_idx]
                 t_comp = C_i / self.f_sv[sv_idx]
                 e_trans = self.config.p_tx * t_trans
                 total_time = t_trans + t_comp
                 
-                if total_time > T_max or total_time > self.T_conn_gt[sv_idx]:
+                if total_time > T_max:
                     is_failed = True
+                    fail_reason = 'deadline'  # 추가: 데드라인 초과
+                elif total_time > self.T_conn_gt[sv_idx]:
+                    is_failed = True
+                    fail_reason = 'connection'  # 추가: 연결 끊김
                     
         cost = self.config.alpha * (t_trans + t_comp) + self.config.beta * (e_trans + e_comp)
         final_cost = 100.0 if is_failed else cost
@@ -685,6 +703,7 @@ class SumoV2XEnv:
         info = {
             'cost': final_cost, 
             'failed': is_failed,
+            'fail_reason': fail_reason,  # 추가
             't_trans': t_trans, 
             't_comp': t_comp,
             'e_trans': e_trans, 
