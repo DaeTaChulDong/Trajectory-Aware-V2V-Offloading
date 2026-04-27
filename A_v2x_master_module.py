@@ -154,15 +154,15 @@ class IntentionEncoder(nn.Module):
 class ConnectionPredictor(nn.Module):
     def __init__(self):
         super(ConnectionPredictor, self).__init__()
-        # 입력 차원 5: [cosine_similarity, dist_norm, rel_speed_norm, heading_diff_norm, shared_path_prob]
+        # 입력 차원 4: [shared_path_prob, dist_norm, rel_speed_norm, heading_diff_norm]
         self.net = nn.Sequential(
-            nn.Linear(5, 32), nn.ReLU(),
+            nn.Linear(4, 32), nn.ReLU(),
             nn.Linear(32, 16), nn.ReLU(),
             nn.Linear(16, 1), nn.Sigmoid()
         )
 
-    def forward(self, similarity, phys_info, shared_path_prob):
-        x = torch.cat([similarity.unsqueeze(-1), phys_info, shared_path_prob.unsqueeze(-1)], dim=-1)
+    def forward(self, phys_info, shared_path_prob):
+        x = torch.cat([shared_path_prob.unsqueeze(-1), phys_info], dim=-1)
         return self.net(x)
 
 class TrajectoryPredictor(nn.Module):
@@ -376,7 +376,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     # 🌟 개선 1: 인코더 구조 강화 (Dropout 추가로 과적합 방지)
     encoder = IntentionEncoder()
     predictor = ConnectionPredictor()
-    optimizer = optim.Adam(list(encoder.parameters()) + list(predictor.parameters()), lr=0.0005)
+    optimizer = optim.Adam(list(predictor.parameters()), lr=0.0005)
 
     # 🌟 개선 2: 에폭 100 + 코사인 스케줄러 (더 부드러운 학습률 감소)
     epochs = 100
@@ -389,12 +389,11 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
             tv_dir = traj_predictor(r1)
             sv_dir = traj_predictor(r2)
             spp = (tv_dir * sv_dir).sum(dim=-1)
-            enriched_dataset.append((r1, r2, phys_info, target_t_norm, spp))
+            enriched_dataset.append((phys_info, target_t_norm, spp))
 
     # 🌟 개선 3: 짧은 연결에 더 큰 가중치를 주는 Weighted MSE Loss
     best_loss = float('inf')
     patience_counter = 0
-    best_encoder_state = None
     best_predictor_state = None
 
     for epoch in range(epochs):
@@ -402,31 +401,27 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
         np.random.shuffle(enriched_dataset)
         batch = enriched_dataset[:4000]
 
-        for r1, r2, phys_info, target_t_norm, spp in batch:
+        for phys_info, target_t_norm, spp in batch:
             optimizer.zero_grad()
-            emb1, emb2 = encoder(r1), encoder(r2)
-            sim = F.cosine_similarity(emb1, emb2)
-
-            predicted_norm = predictor(sim, phys_info, spp)
+            predicted_norm = predictor(phys_info, spp)
             target_t = torch.tensor([[float(target_t_norm)]], dtype=torch.float32)
-            
+
             # 🌟 Weighted Loss: 짧은 연결 오차에 가중치 부여
             base_loss = F.mse_loss(predicted_norm, target_t, reduction='none')
             weight = 1.5 if target_t_norm < 0.33 else (1.3 if target_t_norm < 0.67 else 1.0)
             loss = (base_loss * weight).mean()
-            
+
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
-        
+
         scheduler.step()
         avg_loss = total_loss / len(batch)
-        
+
         # 🌟 개선 4: Early Stopping + Best Model 저장
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
-            best_encoder_state = {k: v.clone() for k, v in encoder.state_dict().items()}
             best_predictor_state = {k: v.clone() for k, v in predictor.state_dict().items()}
         else:
             patience_counter += 1
@@ -441,10 +436,9 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
             break
     
     # 🌟 Best Model 복원
-    if best_encoder_state is not None:
-        encoder.load_state_dict(best_encoder_state)
+    if best_predictor_state is not None:
         predictor.load_state_dict(best_predictor_state)
-        print(f"  ✅ Best Model 복원 완료 (Loss: {best_loss:.4f})")
+        print(f"  ✅ Best Predictor Model 복원 완료 (Loss: {best_loss:.4f})")
     
     # ==========================================
     # 🌟 [Phase 1-C] Predictor 심층 성능 검증 (신규 추가)
@@ -454,35 +448,21 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
         print(" [심층 검증] 인코더 & Predictor 단독 성능 진단")
         print("="*60)
         with torch.no_grad():
-            preds, targets, sims = [], [], []
+            preds, targets = [], []
             for r1, r2, phys_info, target_t_norm in dataset[-500:]:
-                emb1, emb2 = encoder(r1), encoder(r2)
-                sim = F.cosine_similarity(emb1, emb2)
                 tv_dir = traj_predictor(r1)
                 sv_dir = traj_predictor(r2)
                 spp = (tv_dir * sv_dir).sum(dim=-1)
-                pred_norm = predictor(sim, phys_info, spp).item()
-                
+                pred_norm = predictor(phys_info, spp).item()
+
                 preds.append(pred_norm)
                 targets.append(target_t_norm)
-                sims.append(sim.item())
-                
+
             preds = np.array(preds)
             targets = np.array(targets)
-            sims = np.array(sims)
             actual_times = targets * 30.0
-            
-            # 1. 유사도 변별력 확인
-            short_conn = sims[actual_times < 10.0]
-            long_conn = sims[actual_times >= 20.0]
-            mean_sim_short = np.mean(short_conn) if len(short_conn) > 0 else 0
-            mean_sim_long = np.mean(long_conn) if len(long_conn) > 0 else 0
-            print(f" 유사도 변별력 (긴 연결 vs 짧은 연결):")
-            print(f"   - 짧은 연결(<10초) 평균 유사도: {mean_sim_short:.3f}")
-            print(f"   - 긴 연결(>=20초) 평균 유사도: {mean_sim_long:.3f}")
-            print(f"   - 유사도 차이: {mean_sim_long - mean_sim_short:.3f} (목표: > 0.2)")
 
-            # 2. Binary Risk Detector 정확도 (Threshold = 0.4)
+            # Binary Risk Detector 정확도 (Threshold = 0.4)
             target_binary = (targets < 0.4).astype(int)
             pred_binary = (preds < 0.4).astype(int)
             accuracy = np.mean(target_binary == pred_binary) * 100
@@ -523,7 +503,7 @@ class SumoV2XEnv:
     def __init__(self, sumocfg_path, config: V2XConfig, pretrained_encoder=None, pretrained_predictor=None, pretrained_trajectory_predictor=None, sumo_seed=42):
         self.sumocfg_path = sumocfg_path
         self.config = config
-        self.state_dim = 2 + (self.config.max_svs * 3)
+        self.state_dim = 2 + (self.config.max_svs * 4)
         self.action_dim = self.config.max_svs + 1
         self.encoder = pretrained_encoder
         self.predictor = pretrained_predictor
@@ -586,9 +566,6 @@ class SumoV2XEnv:
         self.tv_id = np.random.choice(veh_ids)
         tv_raw = _get_raw_features(self.tv_id, self.net)
         
-        tv_emb = None
-        if self.encoder: tv_emb = self.encoder(tv_raw)
-        
         t_idx = np.random.choice(len(self.config.task_types), p=[t['prob'] for t in self.config.task_types])
         self.task = dict(self.config.task_types[t_idx])
         self.task['D'] *= self.config.task_scale
@@ -630,10 +607,7 @@ class SumoV2XEnv:
                 
                 self.T_conn_gt[sv_count] = self._estimate_actual_connection(vid, max_time)
                 
-                if self.config.use_embedding and self.encoder and self.predictor and tv_emb is not None:
-                    sv_emb = self.encoder(sv_raw)
-                    similarity = F.cosine_similarity(tv_emb, sv_emb)
-
+                if self.config.use_embedding and self.traj_predictor and self.predictor:
                     spd_tv, spd_sv = tv_raw[0][2].item() * 30.0, sv_raw[0][2].item() * 30.0
                     rel_speed_dyn = abs(spd_tv - spd_sv) / 30.0
                     dist_norm = dist / 100.0
@@ -643,23 +617,17 @@ class SumoV2XEnv:
 
                     phys_info = torch.FloatTensor([[dist_norm, rel_speed_dyn, heading_diff]])
 
-                    if self.traj_predictor is not None:
-                        with torch.no_grad():
-                            tv_dir_probs = self.traj_predictor(tv_raw)          # [1, 3]
-                            sv_dir_probs = self.traj_predictor(sv_raw)          # [1, 3]
-                            shared_path_prob = (tv_dir_probs * sv_dir_probs).sum(dim=-1)  # [1]
-                    else:
-                        shared_path_prob = torch.tensor([1.0 / 3.0])
+                    with torch.no_grad():
+                        tv_dir_probs = self.traj_predictor(tv_raw)
+                        sv_dir_probs = self.traj_predictor(sv_raw)
+                        shared_path_prob = (tv_dir_probs * sv_dir_probs).sum(dim=-1)
 
-                    predicted_norm = self.predictor(similarity, phys_info, shared_path_prob).item()
+                    predicted_norm = self.predictor(phys_info, shared_path_prob).item()
 
-                    # State 증강: shared_path_prob를 T_conn 슬롯에 저장
-                    # 마스킹은 Physical과 동일하게 max_time 기반
-                    self.T_conn_predicted[sv_count] = min(max_time, 30.0)  # 마스킹용 (Physical과 동일)
-                    self.shared_path_probs[sv_count] = shared_path_prob.item()  # State 증강용
+                    self.T_conn_predicted[sv_count] = min(max_time, 30.0)
+                    self.shared_path_probs[sv_count] = shared_path_prob.item()
                 else:
                     self.T_conn_predicted[sv_count] = min(max_time, 30.0)
-                    self.shared_path_probs[sv_count] = 1.0  # 인코더 없으면 중립값
 
                 sv_count += 1
                 
@@ -667,10 +635,8 @@ class SumoV2XEnv:
         state[0], state[1] = self.task['D'] / 100.0, self.task['C'] / 100.0
         state[2:2+self.config.max_svs] = self.f_sv / 50.0
         state[2+self.config.max_svs:2+2*self.config.max_svs] = self.R_sv / 100.0
-        if self.config.use_embedding:
-            state[2+2*self.config.max_svs:] = self.shared_path_probs  # 0~1 경로공유확률
-        else:
-            state[2+2*self.config.max_svs:] = self.T_conn_predicted / 30.0  # Physical: max_time
+        state[2+2*self.config.max_svs:2+3*self.config.max_svs] = self.T_conn_predicted / 30.0
+        state[2+3*self.config.max_svs:] = self.shared_path_probs
 
         action_mask = np.zeros(self.action_dim, dtype=np.float32)
         action_mask[0] = 1.0  # 로컬 처리는 항상 가능
@@ -820,7 +786,7 @@ class GreedySNRAgent:
 
     def get_action(self, state, action_mask, deterministic=True):
         state_np = state.squeeze().numpy()
-        max_svs = int((len(state_np) - 2) / 3)
+        max_svs = int((len(state_np) - 2) / 4)
         R_sv_array = state_np[2+max_svs : 2+2*max_svs]
         
         mask_np = action_mask.squeeze().numpy()
@@ -836,7 +802,7 @@ class GreedyCPUAgent:
 
     def get_action(self, state, action_mask, deterministic=True):
         state_np = state.squeeze().numpy()
-        max_svs = int((len(state_np) - 2) / 3)
+        max_svs = int((len(state_np) - 2) / 4)
         f_sv_array = state_np[2 : 2+max_svs]
         
         mask_np = action_mask.squeeze().numpy()
@@ -852,7 +818,7 @@ class GreedyStabilityAgent:
 
     def get_action(self, state, action_mask, deterministic=True):
         state_np = state.squeeze().numpy()
-        max_svs = int((len(state_np) - 2) / 3)
+        max_svs = int((len(state_np) - 2) / 4)
         T_conn_array = state_np[2+2*max_svs : 2+3*max_svs] 
         
         mask_np = action_mask.squeeze().numpy()
