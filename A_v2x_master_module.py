@@ -89,6 +89,28 @@ class V2XConfig:
         self.actor_lr = 3e-4
         self.critic_lr = 1e-3
         self.max_grad_norm = 0.5   
+
+        self.task_types = [
+    # Type 1: 협력 인지 — 가벼운 전송, 빠른 처리, 타이트한 데드라인
+    # avg: 20/30+30/30=1.7s, T_max=3 → 여유 있지만 T_conn<2면 위험
+            {'name': 'CoopPerception', 'prob': 0.25, 'D': 20.0, 'C': 30.0, 'T_max': 3.0},
+    
+    # Type 2: 객체 검출 — 연산 위주, 느린 SV면 데드라인 실패
+    # avg: 10/30+80/30=3.0s, slow f(15): 5.7s>4 → deadline
+            {'name': 'ObjectDetect', 'prob': 0.25, 'D': 10.0, 'C': 20.0, 'T_max': 1.0},
+    
+    # Type 3: 센서 퓨전 — 전송+연산 균형, 양쪽 다 위험
+    # avg: 40/30+40/30=2.7s, T_max=3.5 → 타이트
+            {'name': 'SensorFusion', 'prob': 0.20, 'D': 40.0, 'C': 40.0, 'T_max': 3.5},
+    
+    # Type 4: HD맵 — 전송 위주, 채널 나쁘면 데드라인 실패
+    # avg: 80/30+20/30=3.3s, slow R(15): 6.7s>5 → deadline
+            {'name': 'HDMapUpdate', 'prob': 0.15, 'D': 80.0, 'C': 20.0, 'T_max': 5.0},
+    
+    # Type 5: 경량 알림 — 거의 항상 성공, 로컬도 가능(C/2.5=4s<5s)
+            {'name': 'LightNotify', 'prob': 0.15, 'D': 5.0, 'C': 10.0, 'T_max': 5.0},
+        ]
+        '''
         self.task_types = [
             # Type 1: 평균 소요 10초 (가장 기본 태스크, 꺾어지면 아슬아슬하게 실패)
             {'name': 'Type 1', 'prob': 0.3, 'D': 150.0, 'C': 150.0, 'T_max': 16.0},
@@ -105,6 +127,7 @@ class V2XConfig:
             # Type 5: 평균 소요 6.6초 (가벼운 태스크, 전체 성공률의 바닥을 지지)
             {'name': 'Type 5', 'prob': 0.2, 'D': 100.0, 'C': 100.0, 'T_max': 10.0}
         ]
+        '''
 
 class RolloutBuffer:
     def __init__(self):
@@ -649,14 +672,10 @@ class SumoV2XEnv:
         else:
             state[2+2*self.config.max_svs:] = self.T_conn_predicted / 30.0  # Physical: max_time
 
-        action_mask = np.ones(self.action_dim, dtype=np.float32) 
-        if self.config.use_masking:
-            action_mask = np.zeros(self.action_dim, dtype=np.float32)
-            if (self.task['C'] / self.config.f_tv) <= self.task['T_max']: action_mask[0] = 1.0
-            for j in range(sv_count):
-                if (self.task['D'] / self.R_sv[j] + self.task['C'] / self.f_sv[j]) <= min(self.task['T_max'], self.T_conn_predicted[j]):
-                    action_mask[j+1] = 1.0
-            if np.sum(action_mask) == 0: action_mask[0] = 1.0
+        action_mask = np.zeros(self.action_dim, dtype=np.float32)
+        action_mask[0] = 1.0  # 로컬 처리는 항상 가능
+        for j in range(sv_count):
+            action_mask[j+1] = 1.0  # 통신 범위 내 모든 SV 허용
         
         self.last_action_mask = action_mask
         self.last_num_svs = sv_count
