@@ -66,7 +66,7 @@ def set_seed(seed=42):
 
 class V2XConfig:
     def __init__(self):
-        self.use_masking = True
+        self.use_masking = False
         self.use_embedding = True  
         self.task_scale = 1.0
         self.max_svs = 10
