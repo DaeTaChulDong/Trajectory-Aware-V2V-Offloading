@@ -499,6 +499,37 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     return encoder, predictor, traj_predictor
 
 
+def _linear_predict_conn_time(tv_pos, tv_speed, tv_heading_deg,
+                               sv_pos, sv_speed, sv_heading_deg,
+                               comm_range=100.0, max_t=30.0):
+    """선형 외삽으로 두 차량이 comm_range를 벗어나는 시점(초)을 반환.
+    SUMO heading 규약: 0°=North, 시계방향. vx=speed*sin(h), vy=speed*cos(h).
+    이차방정식의 양의 근으로 해석적으로 계산."""
+    tv_h = math.radians(tv_heading_deg)
+    sv_h = math.radians(sv_heading_deg)
+
+    dvx = tv_speed * math.sin(tv_h) - sv_speed * math.sin(sv_h)
+    dvy = tv_speed * math.cos(tv_h) - sv_speed * math.cos(sv_h)
+
+    dx = tv_pos[0] - sv_pos[0]
+    dy = tv_pos[1] - sv_pos[1]
+
+    A = dvx ** 2 + dvy ** 2
+    B = 2.0 * (dx * dvx + dy * dvy)
+    C = dx ** 2 + dy ** 2 - comm_range ** 2  # C <= 0 (현재 comm_range 내)
+
+    if A < 1e-6:  # 상대속도 거의 0 → 거리 변화 없음
+        return max_t
+
+    disc = B ** 2 - 4.0 * A * C
+    if disc < 0:
+        return max_t
+
+    # C<=0, A>0 이므로 반드시 양의 근이 하나 존재
+    t_exit = (-B + math.sqrt(disc)) / (2.0 * A)
+    return float(min(max(0.0, t_exit), max_t))
+
+
 class SumoV2XEnv:
     def __init__(self, sumocfg_path, config: V2XConfig, pretrained_encoder=None, pretrained_predictor=None, pretrained_trajectory_predictor=None, sumo_seed=42):
         self.sumocfg_path = sumocfg_path
@@ -579,9 +610,14 @@ class SumoV2XEnv:
                 r_mbps = (self.config.B_channel / 1e6) * math.log2(1.0 + snr_linear)
                 self.R_sv[sv_count] = min(max(1.0, r_mbps), 50.0) 
                 
-                rel_speed = abs(tv_raw[0][2].item() - sv_raw[0][2].item()) * 30.0
-                rel_speed_safe = max(rel_speed, 0.1)
-                max_time = min((100.0 - dist) / rel_speed_safe, 30.0)
+                tv_speed = tv_raw[0][2].item() * 30.0
+                tv_heading_deg = tv_raw[0][3].item() * 360.0
+                sv_speed = sv_raw[0][2].item() * 30.0
+                sv_heading_deg = sv_raw[0][3].item() * 360.0
+                max_time = _linear_predict_conn_time(
+                    pos1, tv_speed, tv_heading_deg,
+                    pos2, sv_speed, sv_heading_deg,
+                    comm_range=self.config.comm_range)
                 
                 if self.config.use_embedding and self.traj_predictor and self.predictor:
                     spd_tv, spd_sv = tv_raw[0][2].item() * 30.0, sv_raw[0][2].item() * 30.0
