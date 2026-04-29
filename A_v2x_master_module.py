@@ -233,7 +233,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     prev_edge_dict = {}     # vid -> (edge_id, raw_features) 에지 변화 추적
 
     try:
-        for step in range(num_steps):
+        for _ in range(num_steps):
             traci.simulationStep()
             if traci.simulation.getMinExpectedNumber() <= 0: break
                 
@@ -530,28 +530,6 @@ class SumoV2XEnv:
     def close_sumo(self):
         traci.close()
 
-    def _estimate_actual_connection(self, sv_vid, physical_max):
-        try:
-            sv_route = traci.vehicle.getRoute(sv_vid)
-            sv_idx = traci.vehicle.getRouteIndex(sv_vid)
-            tv_route = traci.vehicle.getRoute(self.tv_id)
-            tv_idx = traci.vehicle.getRouteIndex(self.tv_id)
-            
-            sv_future = sv_route[sv_idx+1 : sv_idx+4]
-            tv_future = tv_route[tv_idx+1 : tv_idx+4]
-            
-            if not sv_future or not tv_future:
-                return physical_max
-            
-            # 다음 엣지는 같으나 그 이후가 다른 경우
-            common = len(set(sv_future) & set(tv_future))
-            total = max(len(sv_future), len(tv_future))
-            ratio = common / max(total, 1) 
-            
-            return physical_max * max(0.3, ratio)
-        except:
-            return physical_max
-
     def reset(self):
         veh_ids = []
         MIN_VEHICLES = 55
@@ -605,8 +583,6 @@ class SumoV2XEnv:
                 rel_speed_safe = max(rel_speed, 0.1)
                 max_time = min((100.0 - dist) / rel_speed_safe, 30.0)
                 
-                self.T_conn_gt[sv_count] = self._estimate_actual_connection(vid, max_time)
-                
                 if self.config.use_embedding and self.traj_predictor and self.predictor:
                     spd_tv, spd_sv = tv_raw[0][2].item() * 30.0, sv_raw[0][2].item() * 30.0
                     rel_speed_dyn = abs(spd_tv - spd_sv) / 30.0
@@ -651,53 +627,68 @@ class SumoV2XEnv:
     def step(self, action):
         D_i, C_i, T_max = self.task['D'], self.task['C'], self.task['T_max']
         is_failed = False
-        fail_reason = 'none'  # 추가
+        fail_reason = 'none'
         t_trans, t_comp, e_trans, e_comp = 0.0, 0.0, 0.0, 0.0
-        
+
         if action == 0:
             t_comp = C_i / self.config.f_tv
-            e_comp = self.config.kappa * C_i * (self.config.f_tv ** 2) 
-            if t_comp > T_max: 
+            e_comp = self.config.kappa * C_i * (self.config.f_tv ** 2)
+            if t_comp > T_max:
                 is_failed = True
-                fail_reason = 'local_deadline'  # 추가
+                fail_reason = 'local_deadline'
+            traci.simulationStep()
         else:
             sv_idx = action - 1
-            if sv_idx >= len(self.sv_list): 
+            if sv_idx >= len(self.sv_list):
                 is_failed = True
-                fail_reason = 'invalid_sv'  # 추가
+                fail_reason = 'invalid_sv'
+                traci.simulationStep()
             else:
                 t_trans = D_i / self.R_sv[sv_idx]
                 t_comp = C_i / self.f_sv[sv_idx]
                 e_trans = self.config.p_tx * t_trans
                 total_time = t_trans + t_comp
-                
+
                 if total_time > T_max:
                     is_failed = True
-                    fail_reason = 'deadline'  # 추가: 데드라인 초과
-                elif total_time > self.T_conn_gt[sv_idx]:
-                    is_failed = True
-                    fail_reason = 'connection'  # 추가: 연결 끊김
-                    
+                    fail_reason = 'deadline'
+                    traci.simulationStep()
+                else:
+                    steps_needed = max(1, int(total_time))
+                    for _ in range(steps_needed):
+                        traci.simulationStep()
+                        try:
+                            pos_tv = traci.vehicle.getPosition(self.tv_id)
+                            pos_sv = traci.vehicle.getPosition(self.sv_list[sv_idx])
+                            dist = math.hypot(pos_tv[0] - pos_sv[0], pos_tv[1] - pos_sv[1])
+                            if dist > self.config.comm_range:
+                                is_failed = True
+                                fail_reason = 'connection'
+                                break
+                        except:
+                            is_failed = True
+                            fail_reason = 'connection'
+                            break
+
         cost = self.config.alpha * (t_trans + t_comp) + self.config.beta * (e_trans + e_comp)
         final_cost = 100.0 if is_failed else cost
         reward = -final_cost
-        
-        done = True 
-        next_state = np.zeros(self.state_dim, dtype=np.float32) 
-        
+
+        done = True
+        next_state = np.zeros(self.state_dim, dtype=np.float32)
+
         info = {
-            'cost': final_cost, 
+            'cost': final_cost,
             'failed': is_failed,
-            'fail_reason': fail_reason,  # 추가
-            't_trans': t_trans, 
+            'fail_reason': fail_reason,
+            't_trans': t_trans,
             't_comp': t_comp,
-            'e_trans': e_trans, 
+            'e_trans': e_trans,
             'e_comp': e_comp,
             'task_type': self.task['name'],
             'num_valid_actions': int(np.sum(self.last_action_mask)),
             'num_svs': self.last_num_svs
         }
-        traci.simulationStep()
         return next_state, reward, done, info
     
     def get_current_sv_info(self):
