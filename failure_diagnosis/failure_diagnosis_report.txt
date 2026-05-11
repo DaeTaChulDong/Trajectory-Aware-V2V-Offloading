@@ -1,0 +1,41 @@
+V2V Failure Diagnosis Report
+======================================================================
+
+[Scheme Summary]
+Scheme                Total  Success%   Fail%      deadline     connection  local_deadline     invalid_sv
+---------------------------------------------------------------------------------------------------------
+Proposed                300     84.7%   15.3%     45( 15.0%)      1(  0.3%)      0(  0.0%)      0(  0.0%)
+Physical                300     81.7%   18.3%     55( 18.3%)      0(  0.0%)      0(  0.0%)      0(  0.0%)
+Greedy-SNR              500     81.6%   18.4%     71( 14.2%)     21(  4.2%)      0(  0.0%)      0(  0.0%)
+Linear Prediction       500     87.4%   12.6%     60( 12.0%)      3(  0.6%)      0(  0.0%)      0(  0.0%)
+
+
+[Task-Type Breakdown]
+
+<< Proposed >>
+  CoopPerception: total=66, fail=2(3.0%)  deadline=2(3.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  ObjectDetect: total=81, fail=34(42.0%)  deadline=34(42.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  SensorFusion: total=62, fail=9(14.5%)  deadline=9(14.5%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  HDMapUpdate: total=40, fail=1(2.5%)  deadline=0(0.0%), connection=1(2.5%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  LightNotify: total=51, fail=0(0.0%)  deadline=0(0.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+
+<< Physical >>
+  CoopPerception: total=67, fail=7(10.4%)  deadline=7(10.4%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  ObjectDetect: total=84, fail=38(45.2%)  deadline=38(45.2%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  SensorFusion: total=66, fail=10(15.2%)  deadline=10(15.2%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  HDMapUpdate: total=43, fail=0(0.0%)  deadline=0(0.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  LightNotify: total=40, fail=0(0.0%)  deadline=0(0.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+
+<< Greedy-SNR >>
+  CoopPerception: total=143, fail=15(10.5%)  deadline=6(4.2%), connection=9(6.3%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  ObjectDetect: total=110, fail=51(46.4%)  deadline=48(43.6%), connection=3(2.7%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  SensorFusion: total=111, fail=24(21.6%)  deadline=17(15.3%), connection=7(6.3%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  HDMapUpdate: total=72, fail=2(2.8%)  deadline=0(0.0%), connection=2(2.8%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  LightNotify: total=64, fail=0(0.0%)  deadline=0(0.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+
+<< Linear Prediction >>
+  CoopPerception: total=123, fail=6(4.9%)  deadline=5(4.1%), connection=1(0.8%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  ObjectDetect: total=114, fail=42(36.8%)  deadline=41(36.0%), connection=1(0.9%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  SensorFusion: total=98, fail=15(15.3%)  deadline=14(14.3%), connection=1(1.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  HDMapUpdate: total=78, fail=0(0.0%)  deadline=0(0.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
+  LightNotify: total=87, fail=0(0.0%)  deadline=0(0.0%), connection=0(0.0%), local_deadline=0(0.0%), invalid_sv=0(0.0%)
