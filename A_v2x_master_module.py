@@ -373,12 +373,12 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
     balanced_dataset = short_oversampled + mid_oversampled + long_data
     print(f"  [데이터 균형] 균형 후: 짧은={len(short_oversampled)}, 중간={len(mid_oversampled)}, 긴={len(long_data)}, 총={len(balanced_dataset)}")
     
-    # 🌟 개선 1: 인코더 구조 강화 (Dropout 추가로 과적합 방지)
+    # 개선 1: 인코더 구조 강화 (Dropout 추가로 과적합 방지)
     encoder = IntentionEncoder()
     predictor = ConnectionPredictor()
     optimizer = optim.Adam(list(predictor.parameters()), lr=0.0005)
 
-    # 🌟 개선 2: 에폭 100 + 코사인 스케줄러 (더 부드러운 학습률 감소)
+    # 개선 2: 에포크 100 + 코사인 스케줄러 (더 부드러운 학습률 감소)
     epochs = 100
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
 
@@ -391,7 +391,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
             spp = (tv_dir * sv_dir).sum(dim=-1)
             enriched_dataset.append((phys_info, target_t_norm, spp))
 
-    # 🌟 개선 3: 짧은 연결에 더 큰 가중치를 주는 Weighted MSE Loss
+    # 개선 3: 짧은 연결에 더 큰 가중치를 주는 Weighted MSE Loss
     best_loss = float('inf')
     patience_counter = 0
     best_predictor_state = None
@@ -406,7 +406,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
             predicted_norm = predictor(phys_info, spp)
             target_t = torch.tensor([[float(target_t_norm)]], dtype=torch.float32)
 
-            # 🌟 Weighted Loss: 짧은 연결 오차에 가중치 부여
+            # Weighted Loss: 짧은 연결 오차에 가중치 부여
             base_loss = F.mse_loss(predicted_norm, target_t, reduction='none')
             weight = 1.5 if target_t_norm < 0.33 else (1.3 if target_t_norm < 0.67 else 1.0)
             loss = (base_loss * weight).mean()
@@ -418,7 +418,7 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
         scheduler.step()
         avg_loss = total_loss / len(batch)
 
-        # 🌟 개선 4: Early Stopping + Best Model 저장
+        # 개선 4: Early Stopping + Best Model 저장
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
@@ -435,13 +435,13 @@ def pretrain_intention_encoder(sumocfg_path, num_steps=8000, seed=42):
             print(f"  ⏹ Early Stopping at Epoch {epoch+1} (20 에폭 연속 개선 없음)")
             break
     
-    # 🌟 Best Model 복원
+    # Best Model 복원
     if best_predictor_state is not None:
         predictor.load_state_dict(best_predictor_state)
         print(f"  ✅ Best Predictor Model 복원 완료 (Loss: {best_loss:.4f})")
     
     # ==========================================
-    # 🌟 [Phase 1-C] Predictor 심층 성능 검증 (신규 추가)
+    # [Phase 1-C] Predictor 심층 성능 검증 (신규 추가)
     # ==========================================
     if len(dataset) >= 500:
         print("\n" + "="*60)
